@@ -37,41 +37,65 @@ def mock_plan(body):
             "diagnostics": [{"toolName": n, "arguments": {"service": inc["service"]}, "evidence": ids[:1]} for n in diag],
             "effect": {"toolName": eff, "arguments": {"service": inc["service"]}, "evidence": ids[:1]}}
 
-async def llm_plan(body):
+async def llm_plan(body, timeout):
     inc, pol = body["incident"], body["policy"]
     user = json.dumps({"incident": {k: inc[k] for k in ("incidentId", "title", "service", "severity", "transcript", "allowedRootCauses")},
                        "toolCatalog": body["toolCatalog"],
                        "policy": {k: pol.get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")}})
-    async with httpx.AsyncClient(timeout=14) as c:
+    async with httpx.AsyncClient(timeout=timeout) as c:
         r = await c.post(os.environ["LLM_BASE_URL"] + "/chat/completions",
                          headers={"Authorization": "Bearer " + os.environ["LLM_KEY"]},
                          json={"model": MODEL, "temperature": 0, "response_format": {"type": "json_object"},
                                "messages": [{"role": "system", "content": SYS}, {"role": "user", "content": user}]})
+    r.raise_for_status()
     return json.loads(r.json()["choices"][0]["message"]["content"])
 
 def check_plan(p, body):
     inc, pol = body["incident"], body["policy"]
-    ids = set(re.findall(r"^\s*\[([^\]]+)\]", inc["transcript"], re.M))
-    ev = list(dict.fromkeys(p["evidence"]))
-    assert p["rootCause"] in inc["allowedRootCauses"] and 2 <= len(ev) <= 4 and set(ev) <= ids
+    ids_list = re.findall(r"^\s*\[([^\]]+)\]", inc["transcript"], re.M)
+    ids = set(ids_list)
+    clean = lambda l: [e.strip().strip("[]") for e in (l or []) if isinstance(e, str)]
+    allowed = inc["allowedRootCauses"]
+    rc = p.get("rootCause")
+    if rc not in allowed:
+        m = [a for a in allowed if isinstance(rc, str) and a.lower() == rc.lower()]
+        if not m: raise ValueError("bad rootCause: %r" % rc)
+        rc = m[0]
+    p["rootCause"] = rc
+    ev = [e for e in dict.fromkeys(clean(p.get("evidence"))) if e in ids][:4]
+    for e in ids_list:
+        if len(ev) >= 2: break
+        if e not in ev: ev.append(e)
+    if len(ev) < 2: raise ValueError("not enough evidence")
     p["evidence"] = ev
     names = {t["name"] for t in body["toolCatalog"]}
-    d = p["diagnostics"]
-    assert 1 <= len(d) <= min(3, pol["maximumDiagnostics"])
-    for x in d:
-        assert x["toolName"] in names and x["toolName"] not in pol["effectTools"]
-        x["evidence"] = [e for e in dict.fromkeys(x.get("evidence", [])) if e in ev] or ev[:1]
-    e = p["effect"]
-    assert e["toolName"] in pol["effectTools"]
-    e["evidence"] = [x for x in dict.fromkeys(e.get("evidence", [])) if x in ev] or ev[:1]
+    limit = max(1, min(3, pol["maximumDiagnostics"]))
+    d = []
+    for x in p.get("diagnostics") or []:
+        if x.get("toolName") in names and x["toolName"] not in pol["effectTools"] and isinstance(x.get("arguments"), dict):
+            x["evidence"] = [e for e in dict.fromkeys(clean(x.get("evidence"))) if e in ev] or ev[:1]
+            d.append({"toolName": x["toolName"], "arguments": x["arguments"], "evidence": x["evidence"]})
+    d = d[:limit]
+    if not d: raise ValueError("no diagnostics")
+    p["diagnostics"] = d
+    e = p.get("effect") or {}
+    if e.get("toolName") not in pol["effectTools"] or not isinstance(e.get("arguments"), dict):
+        raise ValueError("bad effect: %r" % e.get("toolName"))
+    e["evidence"] = [x for x in dict.fromkeys(clean(e.get("evidence"))) if x in ev] or ev[:1]
+    p["effect"] = e
     return p
 
 async def make_plan(body):
     if os.environ.get("MOCK_LLM"): return check_plan(mock_plan(body), body)
-    for _ in range(2):
-        try: return check_plan(await llm_plan(body), body)
-        except Exception as e: print("PLANNER ERROR:", repr(e))
-    raise RuntimeError
+    start = time.time()
+    for i in range(2):
+        left = 15.5 - (time.time() - start)
+        if left < 4: break
+        try:
+            return check_plan(await llm_plan(body, min(left, 13)), body)
+        except Exception as e:
+            print("PLANNER ERROR:", repr(e)[:300], flush=True)
+    raise RuntimeError("planner failed")
 
 # ---------- state machine ----------
 def new_action(st, i, phase, spec):

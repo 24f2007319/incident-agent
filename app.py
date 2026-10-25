@@ -4,7 +4,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 app = FastAPI()
-LOCK = asyncio.Lock()
+LOCKS = {}
+def lk(k): return LOCKS.setdefault(k, asyncio.Lock())
 DB = os.environ.get("DB_PATH", "state.json")
 RUNS = json.load(open(DB)) if os.path.exists(DB) else {}
 MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
@@ -71,9 +72,6 @@ def check_plan(p, body):
         rc = m[0]
     p["rootCause"] = rc
     ev = [e for e in dict.fromkeys(clean(p.get("evidence"))) if e in ids][:4]
-    for e in ids_list:
-        if len(ev) >= 2: break
-        if e not in ev: ev.append(e)
     if len(ev) < 2: raise ValueError("not enough evidence")
     p["evidence"] = ev
     names = {t["name"] for t in body["toolCatalog"]}
@@ -199,7 +197,7 @@ def apply_receipt(st, b):
 # ---------- OTLP ----------
 def A(k, v):
     if isinstance(v, bool): return {"key": k, "value": {"boolValue": v}}
-    if isinstance(v, int): return {"key": k, "value": {"intValue": str(v)}}
+    if isinstance(v, int): return {"key": k, "value": {"intValue": v}}
     return {"key": k, "value": {"stringValue": str(v)}}
 
 def otlp(st):
@@ -225,10 +223,11 @@ def otlp(st):
         if a["phase"] == "diagnostic": diag.append(a)
         for at in a["attempts"]:
             s = at["status"]; failed = s is not None and not (200 <= s < 300)
-            at_ = [A("ga5.action.id", a["actionId"]), A("ga5.attempt", at["attempt"]), A("http.request.method", "POST"),
-                   A("http.request.resend_count", at["attempt"] - 1)]
+            at_ = [A("ga5.action.id", a["actionId"]), A("gen_ai.tool.call.id", a["callId"]),
+                A("ga5.attempt", at["attempt"]), A("http.request.method", "POST"),
+                A("http.request.resend_count", at["attempt"] - 1)]
             if at["receiptId"]: at_ += [A("ga5.receipt.id", at["receiptId"]), A("ga5.receipt.nonce", at["nonce"])]
-            if s: at_.append(A("http.response.status_code", s))
+            if s: at_ += [A("http.response.status_code", s), A("http.status_code", s)]
             if failed: at_.append(A("error.type", at["error"] or str(s)))
             S.append(sp(at["span"], a["span"], f"POST tool/{a['toolName']}", 3, at["start"], at["end"], at_, 2 if failed else None))
     if len(diag) > 1 and all(a["end"] for a in diag):
@@ -236,8 +235,9 @@ def otlp(st):
         S.append(sp(t["join"], t["agent"], "incident.join", 1, j, j, [], None, [a["span"] for a in diag]))
     ap = st["approval"]
     if ap:
-        at_ = [A("ga5.approval.id", ap["approvalId"])]
-        if ap["nonce"]: at_.append(A("ga5.approval.receipt.nonce", ap["nonce"]))
+        at_ = [A("ga5.approval.id", ap["approvalId"]), A("ga5.action.id", ap["actionId"])]
+        if ap["nonce"]: at_ += [A("ga5.approval.receipt.nonce", ap["nonce"]), A("ga5.approval.nonce", ap["nonce"]), A("ga5.receipt.nonce", ap["nonce"])]
+       
         S.append(sp(t["gate"], t["agent"], "approval_gate", 1, ap["start"], ap["end"], at_))
     return {"resourceSpans": [{"resource": {"attributes": [A("service.name", "incident-agent")]},
                                "scopeSpans": [{"scope": {"name": "incident-agent"}, "spans": S}]}]}
@@ -264,7 +264,7 @@ async def create(req: Request):
     except Exception:
         return bad(400)
     h = sha(body)
-    async with LOCK:
+    async with lk(body["runId"]):
         st = RUNS.get(body["runId"])
         if st: return JSONResponse(view(st)) if st["hash"] == h else bad(409, "conflict")
         try: plan = await make_plan(body)
@@ -282,11 +282,11 @@ async def receipt(run_id: str, req: Request):
         b = await req.json(); assert isinstance(b["receiptId"], str) and b["receiptId"]
     except Exception:
         return bad(400)
-    async with LOCK:
+    async with lk(run_id):
         st = RUNS.get(run_id)
         if not st: return bad(404, "not found")
         h = sha(b); prev = st["receipts"].get(b["receiptId"])
-        if prev: return JSONResponse(prev["resp"]) if prev["hash"] == h else bad(409, "conflict")
+        if prev: return JSONResponse(view(st)) if prev["hash"] == h else bad(409, "conflict")
         try: apply_receipt(st, b)
         except Exception: return bad(422)
         resp = view(st); st["receipts"][b["receiptId"]] = {"hash": h, "resp": resp}; save()
